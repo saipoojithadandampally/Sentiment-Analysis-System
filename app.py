@@ -1,191 +1,200 @@
-
-import streamlit as st
+from flask import Flask, request, render_template_string
+from transformers import pipeline
+from pymongo import MongoClient
+from datetime import datetime
 import pandas as pd
-import joblib
-import re
-import plotly.express as px
+import os
 
-# Page configuration
-st.set_page_config(
-    page_title="Sentiment Analysis System",
-    page_icon="📊",
-    layout="wide"
+app = Flask(__name__)
+
+# Load Hugging Face model
+model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+
+sentiment_analyzer = pipeline(
+    "sentiment-analysis",
+    model=model_name,
+    tokenizer=model_name
 )
 
-# Load saved models
-model = joblib.load("sentiment_model.pkl")
-tfidf = joblib.load("tfidf_vectorizer.pkl")
-model_name = joblib.load("model_name.pkl")
+# MongoDB connection
+MONGO_URI = os.environ.get("MONGO_URI")
 
-sentiment_mapping = {
-    0: "Negative",
-    1: "Neutral",
-    2: "Positive"
-}
-
-# Text cleaning function
-def clean_text(text):
-    text = str(text).lower()
-    text = re.sub(r"http\S+|www\S+", "", text)
-    text = re.sub(r"@\w+", "", text)
-    text = re.sub(r"#", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-# Prediction function
-def predict_sentiment(text):
-    cleaned_text = clean_text(text)
-    vector = tfidf.transform([cleaned_text])
-
-    prediction = model.predict(vector)[0]
-    probabilities = model.predict_proba(vector)[0]
-
-    confidence = max(probabilities) * 100
-
-    return sentiment_mapping[prediction], round(confidence, 2)
+client = MongoClient(MONGO_URI)
+db = client["sentiment_analyzer"]
+collection = db["sentiment_records"]
 
 
-# Application heading
-st.title("📊 Sentiment Analysis System")
+def analyze_review(review):
+    prediction = sentiment_analyzer(
+        review,
+        truncation=True,
+        max_length=512
+    )[0]
 
-st.write(
-    "An NLP-based application that analyzes text "
-    "and identifies Positive, Negative and Neutral sentiments."
-)
+    return {
+        "review": review,
+        "sentiment": prediction["label"].lower(),
+        "confidence": round(prediction["score"] * 100, 2),
+        "timestamp": datetime.utcnow()
+    }
 
-st.caption(f"Selected Machine Learning Model: {model_name}")
 
-st.divider()
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI-Based Sentiment Analyzer</title>
+    <style>
+        body {
+            font-family: Arial;
+            background: #f1f5f9;
+            text-align: center;
+            padding: 30px;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            max-width: 650px;
+            margin: auto;
+            border-radius: 12px;
+        }
+        textarea {
+            width: 90%;
+            height: 100px;
+            padding: 12px;
+        }
+        button {
+            background: #2563eb;
+            color: white;
+            padding: 12px 25px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        .section {
+            margin: 25px 0;
+            padding: 15px;
+            background: #f8fafc;
+            border-radius: 8px;
+        }
+        .result {
+            text-align: left;
+            background: #eef2ff;
+            padding: 12px;
+            margin: 10px;
+            border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
 
-# Navigation
-option = st.sidebar.radio(
-    "Choose Analysis",
-    ["Single Review Analysis", "Bulk Review Analysis", "About Project"]
-)
+    <h1>AI-Based Sentiment Analyzer</h1>
+    <p>Analyze customer reviews using NLP and Transformers</p>
 
-# Single review analysis
-if option == "Single Review Analysis":
+    <div class="section">
+        <h2>Single Review Analysis</h2>
 
-    st.header("Analyze a Single Review")
+        <form method="POST">
+            <textarea name="review"
+                placeholder="Enter your customer review..."
+                required></textarea><br><br>
 
-    user_text = st.text_area(
-        "Enter your review or sentence:",
-        placeholder="Example: I really love this product!"
-    )
+            <button type="submit" name="action" value="single">
+                Analyze Sentiment
+            </button>
+        </form>
+    </div>
 
-    if st.button("Analyze Sentiment", type="primary"):
+    <div class="section">
+        <h2>Bulk CSV Analysis</h2>
+        <p>Upload a CSV file containing a column named review.</p>
 
-        if user_text.strip():
+        <form method="POST" enctype="multipart/form-data">
+            <input type="file" name="file"
+                accept=".csv" required><br><br>
 
-            sentiment, confidence = predict_sentiment(user_text)
+            <button type="submit" name="action" value="bulk">
+                Analyze CSV
+            </button>
+        </form>
+    </div>
 
-            st.subheader("Analysis Result")
+    {% if results %}
+        <h2>Analysis Results</h2>
 
-            st.write("**Input Text:**", user_text)
+        {% for item in results %}
+            <div class="result">
+                <p><b>Review:</b> {{ item.review }}</p>
+                <p><b>Sentiment:</b> {{ item.sentiment }}</p>
+                <p><b>Confidence:</b> {{ item.confidence }}%</p>
+            </div>
+        {% endfor %}
+    {% endif %}
 
-            st.metric("Predicted Sentiment", sentiment)
+    {% if error %}
+        <p style="color:red;">{{ error }}</p>
+    {% endif %}
 
-            st.metric("Prediction Confidence", f"{confidence}%")
+</div>
+</body>
+</html>
+"""
 
-            st.progress(confidence / 100)
 
-        else:
-            st.warning("Please enter some text.")
+@app.route("/", methods=["GET", "POST"])
+def home():
 
-# Bulk review analysis
-elif option == "Bulk Review Analysis":
+    results = []
+    error = None
 
-    st.header("Analyze Multiple Reviews")
+    if request.method == "POST":
 
-    uploaded_file = st.file_uploader(
-        "Upload a CSV file containing reviews",
-        type=["csv"]
-    )
+        action = request.form.get("action")
 
-    if uploaded_file is not None:
+        if action == "single":
 
-        try:
-            df = pd.read_csv(uploaded_file)
+            review = request.form.get("review", "").strip()
 
-            if "text" not in df.columns:
-                st.error(
-                    "Your CSV must contain a column named 'text'."
-                )
+            if review:
+                result = analyze_review(review)
+                collection.insert_one(result)
+                results.append(result)
+
+        elif action == "bulk":
+
+            uploaded_file = request.files.get("file")
+
+            if not uploaded_file or not uploaded_file.filename.endswith(".csv"):
+                error = "Please upload a valid CSV file."
 
             else:
-                if st.button("Analyze All Reviews", type="primary"):
+                try:
+                    df = pd.read_csv(uploaded_file)
 
-                    df = df.dropna(subset=["text"]).copy()
-
-                    if df.empty:
-                        st.warning("No valid reviews found.")
+                    if "review" not in df.columns:
+                        error = "CSV must contain a column named review."
 
                     else:
-                        results = df["text"].apply(predict_sentiment)
+                        for review in df["review"].dropna():
+                            review = str(review).strip()
 
-                        df["Sentiment"] = results.apply(
-                            lambda x: x[0]
-                        )
+                            if review:
+                                result = analyze_review(review)
+                                results.append(result)
 
-                        df["Confidence"] = results.apply(
-                            lambda x: x[1]
-                        )
+                        if results:
+                            collection.insert_many(results)
 
-                        st.success("Analysis completed!")
+                except Exception as e:
+                    error = "Unable to process CSV: " + str(e)
 
-                        st.subheader("Analysis Results")
+    return render_template_string(
+        HTML,
+        results=results,
+        error=error
+    )
 
-                        st.dataframe(df, use_container_width=True)
 
-                        st.subheader("Sentiment Distribution")
-
-                        counts = df["Sentiment"].value_counts().reset_index()
-                        counts.columns = ["Sentiment", "Count"]
-
-                        fig = px.bar(
-                            counts,
-                            x="Sentiment",
-                            y="Count",
-                            title="Review Sentiment Distribution"
-                        )
-
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        csv_data = df.to_csv(index=False).encode("utf-8")
-
-                        st.download_button(
-                            "Download Analysis Results",
-                            data=csv_data,
-                            file_name="sentiment_analysis_results.csv",
-                            mime="text/csv"
-                        )
-
-        except Exception as error:
-            st.error(f"Unable to process CSV: {error}")
-
-# About project
-elif option == "About Project":
-
-    st.header("About the Project")
-
-    st.write("""
-    This project uses Natural Language Processing and
-    Machine Learning to classify text into three sentiment
-    categories:
-
-    - Positive
-    - Negative
-    - Neutral
-
-    **Technologies Used:**
-    - Python
-    - Natural Language Processing
-    - TF-IDF
-    - Logistic Regression
-    - Multinomial Naive Bayes
-    - Streamlit
-    - Pandas
-    - Plotly
-    """)
-
-    st.write("Selected model:", model_name)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
